@@ -122,7 +122,7 @@ class MockDBConnector(BaseDBConnector):
         # No-op for mock: index is created on first write
         pass
 
-    def ensure_vector_index(self, index: str, dims: int = 384) -> None:
+    def ensure_vector_index(self, index: str, dims: int = 768) -> None:
         pass  # No-op
 
     # ------------------------------------------------------------------

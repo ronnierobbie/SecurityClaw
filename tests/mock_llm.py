@@ -33,6 +33,11 @@ class MockLLMProvider(BaseLLMProvider):
         self.call_log.append({"type": "embed", "text": text[:80]})
         return vec
 
+    @property
+    def embedding_dimension(self) -> int:
+        """Return the dimension of embeddings produced by this mock."""
+        return self.dims
+
     def chat(
         self,
         messages: list[dict],

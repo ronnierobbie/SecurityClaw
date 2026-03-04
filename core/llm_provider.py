@@ -44,6 +44,11 @@ class BaseLLMProvider(ABC):
     def embed(self, text: str) -> list[float]:
         """Return a dense embedding vector for the given text."""
 
+    @property
+    @abstractmethod
+    def embedding_dimension(self) -> int:
+        """Return the dimension of embeddings produced by this provider."""
+
     def complete(self, prompt: str, **kwargs) -> str:
         """Convenience wrapper: single user message."""
         return self.chat([{"role": "user", "content": prompt}], **kwargs)
@@ -74,6 +79,7 @@ class OllamaProvider(BaseLLMProvider):
         self.embed_model = cfg.get("llm", "ollama_embed_model", default=self.model)
         self.temperature = cfg.get("llm", "temperature", default=0.2)
         self.max_tokens = cfg.get("llm", "max_tokens", default=2048)
+        self._embedding_dim: Optional[int] = None  # Cache embedding dimension
 
     def chat(
         self,
@@ -121,6 +127,24 @@ class OllamaProvider(BaseLLMProvider):
         except Exception as exc:
             logger.error("Ollama embed failed (model=%s): %s", self.embed_model, exc)
             raise
+
+    @property
+    def embedding_dimension(self) -> int:
+        """Return the dimension of embeddings produced by this provider.
+        
+        Caches the dimension after first detection to avoid repeated API calls.
+        """
+        if self._embedding_dim is None:
+            try:
+                test_embed = self.embed("test")
+                self._embedding_dim = len(test_embed)
+                logger.info("Detected embedding dimension: %d", self._embedding_dim)
+            except Exception as exc:
+                logger.error("Could not detect embedding dimension: %s", exc)
+                # Fallback to a reasonable default
+                self._embedding_dim = 768
+                logger.info("Using fallback embedding dimension: %d", self._embedding_dim)
+        return self._embedding_dim
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -176,6 +200,15 @@ class OpenAIProvider(BaseLLMProvider):
         except Exception as exc:
             logger.error("OpenAI embed failed: %s", exc)
             raise
+
+    @property
+    def embedding_dimension(self) -> int:
+        """Return the dimension of embeddings produced by this provider.
+        
+        text-embedding-3-small produces 1536-dimensional embeddings.
+        """
+        # OpenAI's text-embedding-3-small always produces 1536 dimensions
+        return 1536
 
 
 # ──────────────────────────────────────────────────────────────────────────────

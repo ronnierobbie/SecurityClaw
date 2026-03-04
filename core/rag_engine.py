@@ -56,37 +56,60 @@ class RAGEngine:
         Create the vector index with knn_vector mapping if it doesn't exist.
         For OpenSearch, this enables approximate k-NN search.
         
-        If the index exists but has wrong dimensions, recreate it.
+        IMPORTANT: If the index exists, preserve it — never delete it.
+        Only the baseliner should delete and recreate indexes on dimension mismatch.
         """
-        # Detect embedding dimension from LLM
-        try:
-            test_embed = self.llm.embed("test")
-            embedding_dim = len(test_embed)
-        except Exception as exc:
-            logger.warning("Could not detect embedding dimension: %s", exc)
-            embedding_dim = 384
+        # Detect embedding dimension from LLM (but use sensible fallback)
+        embedding_dim = None
+        if self.llm is not None:
+            try:
+                test_embed = self.llm.embed("test")
+                embedding_dim = len(test_embed)
+            except Exception as exc:
+                logger.warning("Could not detect embedding dimension: %s", exc)
+        else:
+            logger.debug("LLM is None — cannot detect embedding dimension")
 
         try:
-            # Check if index exists and verify dimensions
+            # Check if index exists
+            index_exists = False
+            current_dim = None
+            
             if hasattr(self.db, '_client'):
                 client = self.db._client
                 if client.indices.exists(index=self.index):
+                    index_exists = True
                     # Get current mapping to check dimension
                     mapping = client.indices.get_mapping(index=self.index)
                     current_dim = mapping.get(self.index, {}).get('mappings', {}).get('properties', {}).get('embedding', {}).get('dimension')
-                    
-                    if current_dim and current_dim != embedding_dim:
-                        logger.warning(
-                            "Vector index dimension mismatch: index=%d, embedding=%d. Recreating index.",
-                            current_dim, embedding_dim
-                        )
-                        try:
-                            client.indices.delete(index=self.index)
-                            logger.info("Deleted old vector index: %s", self.index)
-                        except Exception as e:
-                            logger.warning("Could not delete index: %s", e)
             
-            # Create/verify index with correct dimensions
+            # If index exists, preserve it and adjust our understanding of dimensions
+            if index_exists and current_dim:
+                logger.info(
+                    "Vector index '%s' already exists (dim=%d). Preserving it.",
+                    self.index, current_dim
+                )
+                # If we detected a different embedding dimension, warn but don't delete
+                if embedding_dim and embedding_dim != current_dim:
+                    logger.warning(
+                        "RAGEngine embedding dimension (%d) differs from stored index (%d). "
+                        "Using stored index dimension. Retrieval may need keyword fallback.",
+                        embedding_dim, current_dim
+                    )
+                return  # Preserve existing index as-is
+
+            # Index doesn't exist — create it
+            if embedding_dim is None:
+                # Use LLM's actual embedding dimension if available, otherwise fallback to 768
+                if self.llm is not None:
+                    embedding_dim = self.llm.embedding_dimension
+                else:
+                    embedding_dim = 768  # Fallback if no LLM available
+                logger.info("Using embedding dimension: %d", embedding_dim)
+            
+            logger.info("Creating new vector index '%s' with dimension %d", self.index, embedding_dim)
+            
+            # Create new index
             if hasattr(self.db, 'ensure_vector_index'):
                 self.db.ensure_vector_index(self.index, dims=embedding_dim)
             else:
@@ -178,27 +201,68 @@ class RAGEngine:
     ) -> list[dict]:
         """
         Embed `query` and return the top-k most similar stored chunks.
+        Falls back to keyword search if embedding fails or LLM unavailable.
         """
         k = k or self.top_k
-        try:
-            query_vec = self.llm.embed(query)
-        except Exception as exc:
-            logger.error("Embed for retrieve failed: %s", exc)
-            return []
+        
+        # Try to embed the query if LLM is available
+        query_vec = None
+        if self.llm is not None:
+            try:
+                query_vec = self.llm.embed(query)
+            except Exception as exc:
+                logger.error("Embed for retrieve failed: %s", exc)
+                logger.info("Falling back to keyword search since embedding failed")
+        else:
+            logger.warning(
+                "LLM is not available for embedding. " 
+                "Attempting keyword-only search."
+            )
 
         filters = None
         if category:
             filters = {"term": {"category": category}}
 
-        hits = self.db.knn_search(
-            index=self.index,
-            vector=query_vec,
-            k=k,
-            filters=filters,
-        )
-        # Filter by similarity threshold (score is typically distance-based;
-        # higher is more similar in cosine/dot-product spaces)
-        return hits
+        # If we have a vector, try KNN search first
+        if query_vec is not None:
+            try:
+                hits = self.db.knn_search(
+                    index=self.index,
+                    vector=query_vec,
+                    k=k,
+                    filters=filters,
+                )
+                return hits
+            except Exception as knn_exc:
+                logger.warning("KNN search failed (%s), falling back to keyword search", knn_exc)
+
+        # Fallback to keyword search if no vector or KNN failed
+        try:
+            query_dict = {
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"multi_match": {
+                                "query": query,
+                                "fields": ["text", "source", "category"]
+                            }}
+                        ]
+                    }
+                },
+                "size": k
+            }
+            
+            if category:
+                query_dict["query"]["bool"]["filter"] = [
+                    {"term": {"category": category}}
+                ]
+            
+            hits = self.db.search(index=self.index, query=query_dict, size=k)
+            logger.info("Keyword search returned %d results", len(hits))
+            return hits
+        except Exception as fallback_exc:
+            logger.error("Keyword search fallback also failed: %s", fallback_exc)
+            return []
 
     def build_context_string(
         self,

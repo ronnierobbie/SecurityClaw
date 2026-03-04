@@ -2,8 +2,9 @@
 skills/threat_analyst/logic.py
 
 RAG-powered reasoning loop that reviews HIGH/CRITICAL findings queued
-by AnomalyWatcher, retrieves behavioral baseline context, and issues
-a verdict (FALSE_POSITIVE | TRUE_THREAT).
+by AnomalyWatcher, retrieves behavioral baseline context, enriches findings
+with external reputation intelligence (AbuseIPDB, AlienVault, VirusTotal, Talos),
+and issues a verdict (FALSE_POSITIVE | TRUE_THREAT).
 
 Context keys consumed:
     context["db"]     -> BaseDBConnector
@@ -31,6 +32,8 @@ def run(context: dict) -> dict:
     llm = context.get("llm")
     memory = context.get("memory")
     cfg = context.get("config")
+    parameters = context.get("parameters", {})
+    conversation_history = context.get("conversation_history", [])
 
     if db is None or llm is None:
         logger.warning("[%s] db or llm not available — skipping.", SKILL_NAME)
@@ -38,13 +41,23 @@ def run(context: dict) -> dict:
 
     instruction = INSTRUCTION_PATH.read_text(encoding="utf-8")
 
-    # ── 1. Read escalation queue from memory ──────────────────────────────────
+    # ── 1. Check for direct chat question first ──────────────────────────────
+    # In chat mode, the question comes via parameters["question"]
+    chat_question = parameters.get("question")
+    
+    # ── 2. Read escalation queue from memory ──────────────────────────────────
     escalations = _parse_escalations(memory)
-    if not escalations:
-        logger.debug("[%s] No escalations pending.", SKILL_NAME)
+    
+    # If no escalations but we have a chat question, use that instead
+    if not escalations and not chat_question:
+        logger.debug("[%s] No escalations or question pending.", SKILL_NAME)
         return {"status": "ok", "analyzed": 0}
-
-    logger.info("[%s] Analyzing %d escalation(s)…", SKILL_NAME, len(escalations))
+    
+    if not escalations and chat_question:
+        escalations = [chat_question]
+        logger.info("[%s] Analyzing question: %s", SKILL_NAME, chat_question[:80])
+    elif escalations:
+        logger.info("[%s] Analyzing %d escalation(s)…", SKILL_NAME, len(escalations))
 
     from core.rag_engine import RAGEngine
 
@@ -52,7 +65,7 @@ def run(context: dict) -> dict:
     verdicts = []
 
     for item in escalations:
-        verdict = _analyze_finding(item, instruction, rag, llm)
+        verdict = _analyze_finding(item, instruction, rag, llm, conversation_history)
         verdicts.append(verdict)
 
         # ── 2. Write verdict back to memory ───────────────────────────────────
@@ -81,9 +94,13 @@ def run(context: dict) -> dict:
 # Core reasoning loop (one finding)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _analyze_finding(finding_desc: str, instruction: str, rag, llm) -> dict:
+def _analyze_finding(finding_desc: str, instruction: str, rag, llm, 
+                     conversation_history: list[dict] = None) -> dict:
     """
-    Retrieve RAG context and ask the LLM for a verdict on one finding.
+    Retrieve RAG context, fetch reputation intelligence, and ask the LLM for a verdict.
+    Supports extracting context from conversation history for follow-up questions.
+    
+    Returns dict with analysis verdict and API query information.
     """
     # Retrieve relevant baseline context
     rag_context = rag.build_context_string(
@@ -91,14 +108,19 @@ def _analyze_finding(finding_desc: str, instruction: str, rag, llm) -> dict:
         category="network_baseline",
     )
 
+    # Extract and enrich with external reputation intelligence
+    # Pass conversation history to help extract IPs/domains from context
+    reputation_context, queried_apis = _enrich_with_reputation(finding_desc, conversation_history)
+
     messages = [
         {"role": "system", "content": instruction},
         {
             "role": "user",
             "content": (
                 f"**Anomaly Finding:**\n{finding_desc}\n\n"
-                f"{rag_context}\n\n"
-                "Based on the above, provide your verdict."
+                f"**Baseline Context:**\n{rag_context}\n\n"
+                f"**Reputation Intelligence:**\n{reputation_context}\n\n"
+                "Based on the above context and reputation data, provide your verdict."
             ),
         },
     ]
@@ -108,12 +130,14 @@ def _analyze_finding(finding_desc: str, instruction: str, rag, llm) -> dict:
         parsed = _parse_json(response)
         if parsed:
             parsed["_finding"] = finding_desc[:200]
+            parsed["_queried_apis"] = queried_apis  # Include which APIs were queried
             return parsed
         return {
             "verdict": "UNKNOWN",
             "confidence": 0,
             "reasoning": response[:500],
             "_finding": finding_desc[:200],
+            "_queried_apis": queried_apis,
         }
     except Exception as exc:
         logger.error("[%s] LLM analysis failed: %s", SKILL_NAME, exc)
@@ -122,6 +146,7 @@ def _analyze_finding(finding_desc: str, instruction: str, rag, llm) -> dict:
             "confidence": 0,
             "reasoning": str(exc),
             "_finding": finding_desc[:200],
+            "_queried_apis": queried_apis,
         }
 
 
@@ -165,3 +190,111 @@ def _parse_json(text: str) -> Optional[dict]:
         except Exception:
             pass
     return None
+
+
+def _enrich_with_reputation(finding_desc: str, conversation_history: list[dict] = None) -> tuple[str, list[str]]:
+    """
+    Extract IPs and domains from finding (and conversation history),
+    fetch reputation intelligence, and format for LLM consumption.
+    
+    Returns:
+        tuple of (formatted_reputation_string, list_of_queried_apis)
+    """
+    try:
+        from core.reputation_intel import get_ip_reputation, get_domain_reputation
+    except ImportError:
+        logger.warning("[%s] reputation_intel module not available", SKILL_NAME)
+        return "No external reputation data available.", []
+
+    # Extract IPs from finding
+    ip_pattern = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+    ips = set(re.findall(ip_pattern, finding_desc))
+
+    # Extract domains from finding
+    domain_pattern = r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b"
+    domains = set(re.findall(domain_pattern, finding_desc.lower()))
+
+    # If no IPs/domains found in the question, check conversation history
+    if not ips and not domains and conversation_history:
+        logger.debug("[%s] No IPs/domains in question, searching conversation history", SKILL_NAME)
+        # Look through recent messages for IPs and domains
+        for msg in conversation_history[-5:]:  # Check recent 5 messages
+            text = msg.get("content", "")
+            found_ips = set(re.findall(ip_pattern, text))
+            found_domains = set(re.findall(domain_pattern, text.lower()))
+            ips.update(found_ips)
+            domains.update(found_domains)
+            if ips or domains:
+                logger.debug("[%s] Found in history: IPs=%s, domains=%s", SKILL_NAME, ips, domains)
+                break
+
+    if not ips and not domains:
+        return "No external reputation data needed (no IPs or domains in question or history).", []
+
+    reputation_lines = []
+    all_queries = set()  # Track all APIs queried
+
+    # Fetch IP reputation
+    for ip in sorted(ips)[:5]:  # Limit to 5 IPs for performance
+        try:
+            intel = get_ip_reputation(ip)
+            if intel.get("queries"):
+                # Track which APIs were queried
+                all_queries.update(intel.get("queries", []))
+                
+                risk = intel.get("combined_risk", "UNKNOWN")
+                reputation_lines.append(f"  • IP {ip}: Risk={risk}")
+                
+                # Add details from available sources
+                if "abuseipdb" in intel:
+                    score = intel["abuseipdb"].get("abuse_score", 0)
+                    reports = intel["abuseipdb"].get("reports", 0)
+                    reputation_lines.append(f"    - AbuseIPDB: {score}% suspicious ({reports} reports)")
+                
+                if "alienvault" in intel:
+                    reputation = intel["alienvault"].get("reputation", "unknown")
+                    pulses = intel["alienvault"].get("pulses", 0)
+                    reputation_lines.append(f"    - AlienVault: {reputation} reputation ({pulses} threat pulses)")
+                
+                if "virustotal" in intel:
+                    malicious = intel["virustotal"].get("malicious", 0)
+                    if malicious > 0:
+                        reputation_lines.append(f"    - VirusTotal: {malicious} vendors flagged as malicious")
+        except Exception as e:
+            logger.debug(f"[{SKILL_NAME}] Reputation lookup failed for IP {ip}: {e}")
+
+    # Fetch domain reputation
+    for domain in sorted(domains)[:5]:  # Limit to 5 domains for performance
+        try:
+            intel = get_domain_reputation(domain)
+            if intel.get("queries"):
+                # Track which APIs were queried
+                all_queries.update(intel.get("queries", []))
+                
+                risk = intel.get("combined_risk", "UNKNOWN")
+                reputation_lines.append(f"  • Domain {domain}: Risk={risk}")
+                
+                # Add details from available sources
+                if "alienvault" in intel:
+                    reputation = intel["alienvault"].get("reputation", "unknown")
+                    pulses = intel["alienvault"].get("pulses", 0)
+                    reputation_lines.append(f"    - AlienVault: {reputation} reputation ({pulses} threat pulses)")
+                
+                if "virustotal" in intel:
+                    malicious = intel["virustotal"].get("malicious", 0)
+                    if malicious > 0:
+                        reputation_lines.append(f"    - VirusTotal: {malicious} vendors flagged as malicious")
+        except Exception as e:
+            logger.debug(f"[{SKILL_NAME}] Reputation lookup failed for domain {domain}: {e}")
+
+    # Format output with queries info
+    result = ""
+    if all_queries:
+        queries_str = ", ".join(sorted(all_queries))
+        result = f"**External Reputation Intelligence** (Queried: {queries_str}):\n" + "\n".join(reputation_lines)
+    elif reputation_lines:
+        result = "**External Reputation Intelligence:**\n" + "\n".join(reputation_lines)
+    else:
+        result = "No external reputation data available (API keys not configured)."
+    
+    return result, list(all_queries)

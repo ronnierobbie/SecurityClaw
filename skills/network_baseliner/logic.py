@@ -68,21 +68,31 @@ def run(context: dict) -> dict:
     )
 
     # ── 3. Check embedding dimension vs existing index dimension ─────────────
-    current_embed_dim = _detect_embed_dim(llm)
+    # Use the LLM's actual embedding dimension
+    current_embed_dim = llm.embedding_dimension if llm is not None else None
     index_dim = _get_index_dim(db, vector_index)
     fresh_start = False
 
     if current_embed_dim and index_dim and current_embed_dim != index_dim:
         logger.warning(
             "[%s] Embedding dimension mismatch: index has %d dims, embed model produces %d dims. "
-            "The vector index will be wiped — all baselines will be re-generated from scratch.",
+            "Deleting and recreating vector index with new dimensions…",
             SKILL_NAME, index_dim, current_embed_dim,
         )
+        # Delete the incompatible index so RAGEngine creates a fresh one
+        try:
+            if hasattr(db, '_client'):
+                client = db._client
+                if client.indices.exists(index=vector_index):
+                    client.indices.delete(index=vector_index)
+                    logger.info("[%s] Deleted vector index '%s' due to dimension mismatch.", SKILL_NAME, vector_index)
+        except Exception as exc:
+            logger.warning("[%s] Could not delete vector index: %s", SKILL_NAME, exc)
         fresh_start = True
     elif index_dim is None:
         fresh_start = True  # No existing index — starting fresh
 
-    # ── 4. Read existing baselines before RAGEngine init (which may wipe index) ─
+    # ── 4. Read existing baselines before RAGEngine init ─
     existing_baselines_by_id: dict[str, dict[str, str]] = {}
     if not fresh_start:
         for ident in grouped_logs:
@@ -94,7 +104,7 @@ def run(context: dict) -> dict:
                     SKILL_NAME, len(prior), ident,
                 )
 
-    # ── 5. Init RAGEngine (handles dim-mismatch wipe + index creation) ────────
+    # ── 5. Init RAGEngine (creates fresh index with correct dimensions) ────────
     from core.rag_engine import RAGEngine
 
     rag = RAGEngine(db=db, llm=llm)
@@ -135,32 +145,101 @@ def run(context: dict) -> dict:
             )
             continue
 
-        # Store all baselines with network/sensor context
+        # Check which baselines have actually changed before storing
+        stored_count = 0
         for baseline in baselines:
+            category = baseline["category"]
+            summary = baseline["summary"]
+            
+            # Extract current metrics
+            metrics = _extract_analytics_metrics(analytics, category)
+            
+            # Check if this baseline has changed
+            prior_baseline_text = prior_baselines.get(category)
+            has_changed, change_summary = _has_baseline_changed(metrics, prior_baseline_text)
+            
+            if not has_changed:
+                logger.info(
+                    "[%s] Skipping %s for %s — %s",
+                    SKILL_NAME,
+                    category,
+                    identifier,
+                    change_summary,
+                )
+                continue
+            
+            # Store baseline since it changed
             doc_id = rag.store(
-                text=baseline["summary"],
-                category=baseline["category"],
+                text=summary,
+                category=category,
                 source=SKILL_NAME,
                 metadata={
                     "identifier_field": identifier_field,
                     "identifier_value": identifier,
-                    "dimension": baseline["category"].replace("network_baseline_", ""),
+                    "dimension": category.replace("network_baseline_", ""),
+                    "change_summary": change_summary,
                 },
             )
             all_stored_docs.append(
                 {
-                    "category": baseline["category"],
+                    "category": category,
                     "identifier": identifier,
                     "doc_id": doc_id,
+                    "change_summary": change_summary,
                 }
             )
+            stored_count += 1
             logger.info(
-                "[%s] Stored %s for %s (id=%s)",
+                "[%s] Stored %s for %s (id=%s) — %s",
                 SKILL_NAME,
-                baseline["category"],
+                category,
                 identifier,
                 doc_id[:8],
+                change_summary,
             )
+        
+        # Store schema observation (field mapping discovery) separately
+        discovered_fields = analytics.get("discovered_fields", {})
+        if discovered_fields:
+            # Check if field schema has changed
+            prior_schema = prior_baselines.get("schema_observation")
+            field_metrics = {"unique_fields": len(discovered_fields)}
+            schema_changed, schema_change_summary = _has_baseline_changed(field_metrics, prior_schema)
+            
+            if schema_changed:
+                schema_text = _format_schema_observation(discovered_fields, identifier_field)
+                schema_doc_id = rag.store(
+                    text=schema_text,
+                    category="schema_observation",
+                    source=SKILL_NAME,
+                    metadata={
+                        "identifier_field": identifier_field,
+                        "identifier_value": identifier,
+                        "field_count": len(discovered_fields),
+                        "change_summary": schema_change_summary,
+                    },
+                )
+                all_stored_docs.append({
+                    "category": "schema_observation",
+                    "identifier": identifier,
+                    "doc_id": schema_doc_id,
+                    "change_summary": schema_change_summary,
+                })
+                logger.info(
+                    "[%s] Stored schema observation for %s (%d fields, id=%s) — %s",
+                    SKILL_NAME,
+                    identifier,
+                    len(discovered_fields),
+                    schema_doc_id[:8],
+                    schema_change_summary,
+                )
+            else:
+                logger.info(
+                    "[%s] Skipping schema observation for %s — %s",
+                    SKILL_NAME,
+                    identifier,
+                    schema_change_summary,
+                )
 
     # ── 4. Update agent memory ────────────────────────────────────────────────
     if memory:
@@ -351,6 +430,129 @@ def _with_prior(prompt: str, existing_baselines: dict, category: str) -> str:
     )
 
 
+def _extract_analytics_metrics(analytics: dict, category: str) -> dict:
+    """Extract key metrics from analytics for comparison against existing baselines."""
+    metrics = {
+        "category": category,
+        "unique_src_ips": len(analytics.get("source_ips", {})),
+        "unique_dst_ips": len(analytics.get("dest_ips", {})),
+        "unique_src_ports": len(analytics.get("source_ports", {})),
+        "unique_dst_ports": len(analytics.get("dest_ports", {})),
+        "unique_protocols": len(analytics.get("protocols", {})),
+        "unique_dns_domains": len(analytics.get("dns_queries", {})),
+        "total_flows": analytics.get("flow_stats", {}).get("total_flows", 0),
+        "total_bytes": analytics.get("flow_stats", {}).get("total_bytes", 0),
+        "total_packets": analytics.get("flow_stats", {}).get("total_packets", 0),
+        "unique_fields": len(analytics.get("discovered_fields", {})),
+    }
+    
+    # Extract top items for comparison
+    src_ips = analytics.get("source_ips", {})
+    metrics["top_5_src_ips"] = sorted(src_ips.items(), key=lambda x: x[1], reverse=True)[:5]
+    
+    dst_ips = analytics.get("dest_ips", {})
+    metrics["top_5_dst_ips"] = sorted(dst_ips.items(), key=lambda x: x[1], reverse=True)[:5]
+    
+    dst_ports = analytics.get("dest_ports", {})
+    metrics["top_5_dst_ports"] = sorted(dst_ports.items(), key=lambda x: x[1], reverse=True)[:5]
+    
+    protocols = analytics.get("protocols", {})
+    metrics["top_protocols"] = sorted(protocols.items(), key=lambda x: x[1], reverse=True)[:5]
+    
+    return metrics
+
+
+def _has_baseline_changed(new_metrics: dict, baseline_text: str | None) -> tuple[bool, str]:
+    """
+    Compare new metrics against existing baseline text.
+    Returns (changed: bool, change_summary: str).
+    
+    Detects meaningful changes like new IPs, port distribution changes, traffic growth, etc.
+    """
+    if not baseline_text:
+        return True, "New baseline (no prior baseline exists)"
+    
+    changes = []
+    
+    # Try to parse metrics from baseline text
+    # Look for patterns like "Total flows: 10000" or "unique IPs: 42"
+    
+    # Check for field count changes (indicates schema evolution)
+    if "unique_fields" in baseline_text:
+        # Extract old field count using regex
+        match = re.search(r"(\d+) fields", baseline_text)
+        if match:
+            old_field_count = int(match.group(1))
+            new_field_count = new_metrics["unique_fields"]
+            if abs(new_field_count - old_field_count) > 2:  # Allow small variance
+                changes.append(f"Field count: {old_field_count} → {new_field_count}")
+    
+    # Check for flow count changes (significant growth/shrinkage)
+    if "Total flows:" in baseline_text or "total flows:" in baseline_text.lower():
+        match = re.search(r"[Tt]otal flows[:\s]+(\d+)", baseline_text)
+        if match:
+            old_flows = int(match.group(1))
+            new_flows = new_metrics["total_flows"]
+            change_pct = abs(new_flows - old_flows) / max(old_flows, 1) * 100
+            if change_pct > 10:  # >10% change
+                changes.append(f"Total flows: {old_flows:,} → {new_flows:,} ({change_pct:.0f}% change)")
+    
+    # Check for traffic volume changes
+    if "Total bytes:" in baseline_text:
+        match = re.search(r"[Tt]otal bytes[:\s]+(\d+)", baseline_text)
+        if match:
+            old_bytes = int(match.group(1))
+            new_bytes = new_metrics["total_bytes"]
+            change_pct = abs(new_bytes - old_bytes) / max(old_bytes, 1) * 100
+            if change_pct > 15:  # >15% change
+                changes.append(f"Traffic volume: {old_bytes:,} → {new_bytes:,} bytes")
+    
+    # Check for new IPs in top talkers
+    if "TOP SOURCE IPs" in baseline_text or "TOP DESTINATION IPs" in baseline_text:
+        new_src_ips = set(ip for ip, _ in new_metrics.get("top_5_src_ips", []))
+        new_dst_ips = set(ip for ip, _ in new_metrics.get("top_5_dst_ips", []))
+        
+        # Simple heuristic: if top 5 IPs have changed, something changed
+        baseline_mentions_ips = bool(
+            re.search(r"\d+\.\d+\.\d+\.\d+", baseline_text)
+        )
+        
+        if baseline_mentions_ips and (new_src_ips or new_dst_ips):
+            # Extract IPs from baseline text
+            old_ips = set(re.findall(r"\d+\.\d+\.\d+\.\d+", baseline_text))
+            if old_ips and new_src_ips | new_dst_ips:
+                new_ips = (new_src_ips | new_dst_ips) - old_ips
+                if new_ips:
+                    changes.append(f"New IPs detected: {', '.join(sorted(new_ips)[:3])}")
+    
+    # Check for port usage changes
+    if "TOP DESTINATION PORTS" in baseline_text:
+        match = re.findall(r"(\d+)/[^:]+:\s+(\d+) flows", baseline_text)
+        if match:
+            old_top_ports = {int(m[0]): int(m[1]) for m in match[:3]}
+            new_top_ports = {port: count for port, count in new_metrics.get("top_5_dst_ports", [])[:3]}
+            
+            # Check if port distribution significantly changed
+            old_port_set = set(old_top_ports.keys())
+            new_port_set = set(new_top_ports.keys())
+            
+            if old_port_set != new_port_set:
+                added = new_port_set - old_port_set
+                removed = old_port_set - new_port_set
+                change_note = []
+                if added:
+                    change_note.append(f"new ports {added}")
+                if removed:
+                    change_note.append(f"removed ports {removed}")
+                if change_note:
+                    changes.append(f"Port distribution changed: {', '.join(change_note)}")
+    
+    if changes:
+        return True, "; ".join(changes)
+    else:
+        return False, "No significant changes detected"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _generate_baseline_documents(
@@ -361,8 +563,11 @@ def _generate_baseline_documents(
     existing_baselines: dict | None = None,
 ) -> list[dict]:
     """
-    Generate multiple baseline documents covering different network dimensions.
-    Each document is a focused analysis of a specific aspect, enabling better RAG retrieval.
+    Generate baseline documents that comprehensively document the discovered fields.
+    
+    Instead of analyzing specific aspects, document WHAT FIELDS EXIST and WHAT THEY CONTAIN.
+    This allows RAG querier to be truly data-agnostic: it just extracts search terms and 
+    searches - the LLM knows from the field documentation what to extract from results.
     
     If existing_baselines ({category: prior_text}) is supplied, each LLM prompt
     will include the prior summary so the model can update rather than replace it.
@@ -372,173 +577,304 @@ def _generate_baseline_documents(
     existing_baselines = existing_baselines or {}
     baselines = []
     
-    # ── Baseline 1: Protocol & Service Baseline ────────────────────────────────
-    protocols = analytics.get("protocols", {})
-    services = analytics.get("services", {})
-    top_ports = analytics.get("dest_ports", {})
-    
-    if protocols or top_ports:
-        proto_section = "\n".join([
-            f"{proto}: {count} flows" for proto, count in list(protocols.items())[:5]
-        ])
-        port_section = "\n".join([
-            f"{services.get(port, 'unknown')}/{port}: {count} flows"
-            for port, count in list(top_ports.items())[:10]
-        ])
-        
-        proto_prompt = f"""Analyze the protocol and service landscape based on:
-
-PROTOCOLS:
-{proto_section}
-
-TOP PORTS:
-{port_section}
-
-Produce a single-sentence summary of the typical protocols and services in use."""
-        
-        response = llm.chat([
-            {"role": "system", "content": "You are a network analyst. Produce concise, factual summaries."},
-            {"role": "user", "content": _with_prior(proto_prompt, existing_baselines, "network_baseline_protocols_services")},
-        ])
-        baselines.append({
-            "summary": response,
-            "category": "network_baseline_protocols_services",
-        })
-    
-    # ── Baseline 2: Port Landscape Baseline ────────────────────────────────────
-    if top_ports:
-        port_detail = "\n".join([
-            f"{port} ({services.get(port, 'unknown')}): {count} flows"
-            for port, count in list(top_ports.items())[:15]
-        ])
-        
-        port_prompt = f"""Analyze this port landscape showing typical destination ports and their usage:
-
-{port_detail}
-
-Produce a clear summary of the port distribution and which services are most active."""
-        
-        response = llm.chat([
-            {"role": "system", "content": "You are a network analyst. Be specific and factual."},
-            {"role": "user", "content": _with_prior(port_prompt, existing_baselines, "network_baseline_port_landscape")},
-        ])
-        baselines.append({
-            "summary": response,
-            "category": "network_baseline_port_landscape",
-        })
-    
-    # ── Baseline 3: IP Communication Baseline ──────────────────────────────────
+    # ── PRIMARY: Comprehensive Field Documentation ─────────────────────────────
+    # Generate a detailed field documentation that tells users exactly what data is available
+    discovered_fields = analytics.get("discovered_fields", {})
     src_ips = analytics.get("source_ips", {})
     dst_ips = analytics.get("dest_ips", {})
-    ip_pairs = analytics.get("ip_pairs", {})
+    dest_ports = analytics.get("dest_ports", {})
+    protocols = analytics.get("protocols", {})
+    flow_stats = analytics.get("flow_stats", {})
+    dns = analytics.get("dns_queries", {})
+    geoip = analytics.get("geoip_data", {})
     
-    if src_ips and dst_ips and ip_pairs:
-        src_detail = "\n".join([f"{ip}: {count} flows" for ip, count in list(src_ips.items())[:10]])
-        dst_detail = "\n".join([f"{ip}: {count} flows" for ip, count in list(dst_ips.items())[:10]])
-        pair_detail = "\n".join([
-            f"{src} → {dst}: {count} flows" for (src, dst), count in list(ip_pairs.items())[:10]
+    if discovered_fields:
+        # Build a comprehensive field documentation
+        field_doc_lines = [
+            "COMPREHENSIVE FIELD DOCUMENTATION",
+            "=" * 60,
+            "",
+        ]
+        
+        # Sort fields by frequency
+        sorted_fields = sorted(discovered_fields.items(), key=lambda x: x[1], reverse=True)
+        total_records = flow_stats.get("total_flows", 1)
+        
+        for field_name, count in sorted_fields[:40]:  # Top 40 fields
+            frequency_pct = (count / total_records) * 100
+            
+            # Extract example values for this field from logs
+            field_doc_lines.append(f"\nFIELD: {field_name}")
+            field_doc_lines.append(f"  Frequency: {frequency_pct:.1f}% ({count} of {total_records} records)")
+            
+            # Try to infer field type and provide examples
+            if "@timestamp" in field_name:
+                field_doc_lines.append(f"  Type: ISO 8601 timestamp string")
+                field_doc_lines.append(f"  Description: When the network event occurred")
+                field_doc_lines.append(f"  Example: 2026-02-13T14:32:51.123Z")
+            
+            elif "ip" in field_name.lower() or "address" in field_name.lower():
+                field_doc_lines.append(f"  Type: IPv4 address string")
+                field_doc_lines.append(f"  Description: IP address involved in traffic")
+                # Get examples
+                if "source" in field_name.lower() or "orig" in field_name.lower():
+                    examples = list(src_ips.keys())[:3]
+                    field_doc_lines.append(f"  Examples: {', '.join(examples)}")
+                else:
+                    examples = list(dst_ips.keys())[:3]
+                    field_doc_lines.append(f"  Examples: {', '.join(examples)}")
+            
+            elif "port" in field_name.lower():
+                field_doc_lines.append(f"  Type: integer (1-65535)")
+                field_doc_lines.append(f"  Description: Port number in network traffic")
+                examples = list(dest_ports.keys())[:3]
+                field_doc_lines.append(f"  Examples: {', '.join(str(e) for e in examples)}")
+            
+            elif "protocol" in field_name.lower() or "proto" in field_name.lower() or "transport" in field_name.lower():
+                field_doc_lines.append(f"  Type: protocol name string")
+                field_doc_lines.append(f"  Description: Network protocol in use")
+                examples = list(protocols.keys())[:3]
+                if examples:
+                    field_doc_lines.append(f"  Examples: {', '.join(examples)}")
+            
+            elif "dns" in field_name.lower() or "query" in field_name.lower() or "domain" in field_name.lower():
+                field_doc_lines.append(f"  Type: domain name string")
+                field_doc_lines.append(f"  Description: DNS query or domain name")
+                examples = list(dns.keys())[:3]
+                if examples:
+                    field_doc_lines.append(f"  Examples: {', '.join(examples)}")
+            
+            elif "bytes" in field_name.lower():
+                field_doc_lines.append(f"  Type: integer")
+                field_doc_lines.append(f"  Description: Number of bytes transmitted")
+                field_doc_lines.append(f"  Example: {flow_stats.get('total_bytes', 0)}")
+            
+            elif "packet" in field_name.lower():
+                field_doc_lines.append(f"  Type: integer")
+                field_doc_lines.append(f"  Description: Number of packets")
+                field_doc_lines.append(f"  Example: {flow_stats.get('total_packets', 0)}")
+            
+            elif "geo" in field_name.lower():
+                field_doc_lines.append(f"  Type: geographic location string")
+                field_doc_lines.append(f"  Description: Country/city where IP is located")
+                examples = list(geoip.values())[:3]
+                if examples:
+                    field_doc_lines.append(f"  Examples: {', '.join(examples)}")
+            
+            else:
+                field_doc_lines.append(f"  Type: string or numeric")
+                field_doc_lines.append(f"  Description: Network traffic data")
+        
+        field_doc_lines.extend([
+            "",
+            "=" * 60,
+            "Use these field names exactly as shown when searching for specific data.",
+            "The LLM will use this documentation to extract answers from log records.",
         ])
         
-        ip_prompt = f"""Analyze the IP communication patterns:
-
-TOP SOURCE IPs (clients):
-{src_detail}
-
-TOP DESTINATION IPs (servers):
-{dst_detail}
-
-COMMON COMMUNICATION PAIRS:
-{pair_detail}
-
-Summarize the typical source IPs, destination IPs, and common communication paths."""
+        field_doc_text = "\n".join(field_doc_lines)
         
         response = llm.chat([
-            {"role": "system", "content": "You are a network analyst. Focus on communication patterns."},
-            {"role": "user", "content": _with_prior(ip_prompt, existing_baselines, "network_baseline_ip_communication")},
+            {"role": "system", "content": "You are documenting data fields. Be precise and factual. Return exactly what was provided."},
+            {"role": "user", "content": _with_prior(
+                f"Document these fields perfectly:\n\n{field_doc_text}",
+                existing_baselines, 
+                "field_documentation"
+            )},
         ])
         baselines.append({
             "summary": response,
-            "category": "network_baseline_ip_communication",
+            "category": "field_documentation",
         })
     
-    # ── Baseline 4: Traffic Direction Baseline ─────────────────────────────────
-    directions = analytics.get("directions", {})
+    # ── NETWORK BEHAVIOR BASELINE ──────────────────────────────────────────────
+    # Document traffic patterns: IP-to-IP flows, volume trends, common connections
+    ip_pairs = analytics.get("ip_pairs", {})
     flow_stats = analytics.get("flow_stats", {})
     
-    if directions and flow_stats:
-        total_flows = flow_stats.get("total_flows", 1)
-        direction_detail = "\n".join([
-            f"{direction}: {count} flows ({(count/total_flows)*100:.1f}%)"
-            for direction, count in directions.items()
+    if ip_pairs or flow_stats:
+        behavior_lines = [
+            "NETWORK BASELINE BEHAVIOR PATTERNS",
+            "=" * 60,
+            "",
+            "FLOW STATISTICS:",
+            f"  Total flows: {flow_stats.get('total_flows', 0):,}",
+            f"  Total bytes: {flow_stats.get('total_bytes', 0):,}",
+            f"  Total packets: {flow_stats.get('total_packets', 0):,}",
+            f"  Average bytes per flow: {flow_stats.get('avg_bytes_per_flow', 0):.1f}",
+            f"  Average duration: {flow_stats.get('avg_duration_us', 0):.0f} microseconds",
+            "",
+            "COMMON IP-TO-IP CONNECTIONS (Source → Destination):",
+        ]
+        
+        for (src, dst), count in list(ip_pairs.items())[:20]:
+            pct = (count / max(flow_stats.get("total_flows", 1), 1)) * 100
+            behavior_lines.append(f"  {src} → {dst}: {count} flows ({pct:.1f}%)")
+        
+        behavior_lines.extend([
+            "",
+            "=" * 60,
+            "These patterns represent the established baseline for this network.",
+            "Use these to identify anomalies or unexpected communication patterns.",
         ])
         
-        direction_prompt = f"""Analyze the traffic direction breakdown:
-
-{direction_detail}
-
-Summarize the typical traffic direction mix (inbound/outbound/internal percentages)."""
-        
+        behavior_text = "\n".join(behavior_lines)
         response = llm.chat([
-            {"role": "system", "content": "You are a network analyst."},
-            {"role": "user", "content": _with_prior(direction_prompt, existing_baselines, "network_baseline_traffic_direction")},
+            {"role": "system", "content": "You are documenting network baseline behavior. Be precise about traffic patterns."},
+            {"role": "user", "content": _with_prior(
+                f"Document this network baseline:\n\n{behavior_text}",
+                existing_baselines,
+                "network_behavior_baseline"
+            )},
         ])
         baselines.append({
             "summary": response,
-            "category": "network_baseline_traffic_direction",
+            "category": "network_behavior_baseline",
         })
     
-    # ── Baseline 5: External Contacts Baseline (GeoIP) ────────────────────────
+    # ── PROTOCOL & PORT ANALYSIS BASELINE ──────────────────────────────────────
+    # Document which protocols and ports are used in normal baseline traffic
+    protocols = analytics.get("protocols", {})
+    dest_ports = analytics.get("dest_ports", {})
+    source_ports = analytics.get("source_ports", {})
+    services = analytics.get("services", {})
+    
+    if protocols or dest_ports:
+        protocol_lines = [
+            "PROTOCOL AND PORT USAGE BASELINE",
+            "=" * 60,
+            "",
+        ]
+        
+        if protocols:
+            protocol_lines.append("PROTOCOL DISTRIBUTION:")
+            total_flows = max(flow_stats.get("total_flows", 1), 1)
+            for proto, count in list(protocols.items())[:15]:
+                pct = (count / total_flows) * 100
+                protocol_lines.append(f"  {proto}: {count} flows ({pct:.1f}%)")
+            protocol_lines.append("")
+        
+        if dest_ports:
+            protocol_lines.append("TOP DESTINATION PORTS (Server Ports):")
+            for port, count in list(dest_ports.items())[:20]:
+                service = services.get(port, "unknown")
+                pct = (count / total_flows) * 100
+                protocol_lines.append(f"  {port}/{service}: {count} flows ({pct:.1f}%)")
+            protocol_lines.append("")
+        
+        if source_ports:
+            protocol_lines.append("TOP SOURCE PORTS (Client Ports):")
+            for port, count in list(source_ports.items())[:10]:
+                pct = (count / total_flows) * 100
+                protocol_lines.append(f"  {port}: {count} flows ({pct:.1f}%)")
+        
+        protocol_lines.extend([
+            "",
+            "=" * 60,
+            "These ports represent normal baseline communication.",
+            "Unused ports or unexpected protocols may indicate threats.",
+        ])
+        
+        protocol_text = "\n".join(protocol_lines)
+        response = llm.chat([
+            {"role": "system", "content": "You are documenting protocol and port usage. Be specific about what is normal."},
+            {"role": "user", "content": _with_prior(
+                f"Document this protocol baseline:\n\n{protocol_text}",
+                existing_baselines,
+                "protocol_port_baseline"
+            )},
+        ])
+        baselines.append({
+            "summary": response,
+            "category": "protocol_port_baseline",
+        })
+    
+    # ── IP RELATIONSHIPS BASELINE ──────────────────────────────────────────────
+    # Document which IPs communicate internally, which are external, geographic patterns
+    src_ips = analytics.get("source_ips", {})
+    dst_ips = analytics.get("dest_ips", {})
     geoip = analytics.get("geoip_data", {})
-    dst_ips_list = list(analytics.get("dest_ips", {}).items())
     
-    if geoip or dst_ips_list:
-        external_ips = [ip for ip in dict(dst_ips_list).keys() 
-                       if not _is_private_ip(ip)][:10]
+    if src_ips or dst_ips or geoip:
+        ip_lines = [
+            "IP COMMUNICATION BASELINE",
+            "=" * 60,
+            "",
+        ]
         
-        geo_detail = "\n".join([
-            f"{ip}: {geoip.get(ip, 'Unknown')}" for ip in external_ips if ip in geoip
-        ]) or "No GeoIP data available"
+        if src_ips:
+            ip_lines.append("TOP SOURCE IPs (Internal Hosts):")
+            for ip, count in list(src_ips.items())[:15]:
+                pct = (count / max(flow_stats.get("total_flows", 1), 1)) * 100
+                is_private = _is_private_ip(ip)
+                ip_type = "Internal" if is_private else "External"
+                ip_lines.append(f"  {ip} ({ip_type}): {count} flows ({pct:.1f}%)")
+            ip_lines.append("")
         
-        external_prompt = f"""Analyze the external IP contacts:
-
-EXTERNAL DESTINATION IPs:
-{', '.join(external_ips) if external_ips else 'Primarily internal communication'}
-
-GEO DATA:
-{geo_detail}
-
-Summarize which external systems/regions are contacted and their frequency."""
+        if dst_ips:
+            ip_lines.append("TOP DESTINATION IPs (Targets):")
+            for ip, count in list(dst_ips.items())[:15]:
+                pct = (count / max(flow_stats.get("total_flows", 1), 1)) * 100
+                is_private = _is_private_ip(ip)
+                ip_type = "Internal" if is_private else "External"
+                location = geoip.get(ip, "Unknown")
+                ip_lines.append(f"  {ip} ({ip_type}) from {location}: {count} flows ({pct:.1f}%)")
         
+        ip_lines.extend([
+            "",
+            "=" * 60,
+            "These IPs represent established communication patterns.",
+            "New or unexpected IPs may warrant investigation.",
+        ])
+        
+        ip_text = "\n".join(ip_lines)
         response = llm.chat([
-            {"role": "system", "content": "You are a network analyst."},
-            {"role": "user", "content": _with_prior(external_prompt, existing_baselines, "network_baseline_external_contacts")},
+            {"role": "system", "content": "You are documenting IP communication patterns. Distinguish internal vs external."},
+            {"role": "user", "content": _with_prior(
+                f"Document this IP baseline:\n\n{ip_text}",
+                existing_baselines,
+                "ip_communication_baseline"
+            )},
         ])
         baselines.append({
             "summary": response,
-            "category": "network_baseline_external_contacts",
+            "category": "ip_communication_baseline",
         })
     
-    # ── Baseline 6: DNS Activity Baseline ──────────────────────────────────────
+    # ── DNS BASELINE ────────────────────────────────────────────────────────────
+    # Document which domains are queried in normal baseline traffic
     dns = analytics.get("dns_queries", {})
     
     if dns:
-        dns_detail = "\n".join([
-            f"{domain}: {count} queries" for domain, count in list(dns.items())[:15]
+        dns_lines = [
+            "DNS QUERY BASELINE",
+            "=" * 60,
+            "",
+            "COMMON DNS QUERIES:",
+        ]
+        
+        for domain, count in list(dns.items())[:20]:
+            dns_lines.append(f"  {domain}: {count} queries")
+        
+        dns_lines.extend([
+            "",
+            "=" * 60,
+            "These DNS queries represent normal baseline domain lookups.",
+            "Unexpected DNS queries to suspicious domains may indicate threats.",
         ])
         
-        dns_prompt = f"""Analyze the DNS query patterns:
-
-{dns_detail}
-
-Summarize the typical DNS queries and domains being resolved."""
-        
+        dns_text = "\n".join(dns_lines)
         response = llm.chat([
-            {"role": "system", "content": "You are a network analyst."},
-            {"role": "user", "content": _with_prior(dns_prompt, existing_baselines, "network_baseline_dns_activity")},
+            {"role": "system", "content": "You are documenting DNS query patterns. List the domains accessed."},
+            {"role": "user", "content": _with_prior(
+                f"Document this DNS baseline:\n\n{dns_text}",
+                existing_baselines,
+                "dns_baseline"
+            )},
         ])
         baselines.append({
             "summary": response,
-            "category": "network_baseline_dns_activity",
+            "category": "dns_baseline",
         })
     
     return baselines
@@ -600,6 +936,7 @@ def _analyze_network_logs(logs: list[dict]) -> dict:
       - geoip_data: {ip: location}
       - dns_queries: {domain: count}
       - flow_stats: {metric: value}
+      - discovered_fields: {field_name: count} — schema observation
     """
     source_ips = Counter()
     dest_ips = Counter()
@@ -613,44 +950,60 @@ def _analyze_network_logs(logs: list[dict]) -> dict:
     services = {}
     geoip_data = {}
     dns_queries = Counter()
+    discovered_fields = Counter()  # Track which fields we actually find
     
     total_bytes = 0
     total_packets = 0
     durations = []
 
     for log in logs:
+        # Track all top-level fields we discover
+        for field in log.keys():
+            discovered_fields[field] += 1
+        
         # ── Extract source info (multiple possible field paths) ────────────────
-        src_ip = _extract_value(log, ["source.ip", "src_ip", "source_address"])
-        src_port = _extract_value(log, ["source.port", "src_port", "source_port"])
+        src_ip = _extract_value(log, ["source.ip", "src_ip", "source_address", "id.orig_h"])
+        src_port = _extract_value(log, ["source.port", "src_port", "source_port", "id.orig_p"])
         
         # ── Extract destination info ───────────────────────────────────────────
-        dst_ip = _extract_value(log, ["destination.ip", "dest_ip", "destination_address"])
-        dst_port = _extract_value(log, ["destination.port", "dest_port", "destination_port"])
+        dst_ip = _extract_value(log, ["destination.ip", "dest_ip", "destination_address", "id.resp_h"])
+        dst_port = _extract_value(log, ["destination.port", "dest_port", "destination_port", "id.resp_p"])
         
         # ── Extract protocol/service info ──────────────────────────────────────
-        protocol = _extract_value(log, ["network.transport", "protocol", "transport"])
-        service = _extract_value(log, ["network.protocol", "service"])
+        protocol = _extract_value(log, ["network.transport", "protocol", "transport", "proto"])
+        service = _extract_value(log, ["network.protocol", "service", "app_proto"])
         
         # ── Extract direction ──────────────────────────────────────────────────
-        direction = _extract_value(log, ["network.direction", "direction", "flow_direction"])
+        direction = _extract_value(log, ["network.direction", "direction", "flow_direction", "event.direction"])
         
         # ── Extract volume metrics ─────────────────────────────────────────────
-        src_bytes = _extract_value(log, ["source.bytes", "bytes_sent", "src_bytes"])
-        dst_bytes = _extract_value(log, ["destination.bytes", "bytes_recv", "bytes_received"])
+        src_bytes = _extract_value(log, ["source.bytes", "bytes_sent", "src_bytes", "orig_bytes"])
+        dst_bytes = _extract_value(log, ["destination.bytes", "bytes_recv", "bytes_received", "resp_bytes"])
         total_net_bytes = _extract_value(log, ["network.bytes", "bytes_total"])
         packets = _extract_value(log, ["network.packets", "packets_total", "event.packets"])
         duration = _extract_value(log, ["event.duration", "duration_us", "duration_ms"])
         
-        # ── Extract GeoIP info if available ────────────────────────────────────
-        dst_geo = _extract_value(log, ["destination.geo"])
+        # ── Extract GeoIP info (data-agnostic) ─────────────────────────────────
+        # Try multiple field paths for destination GeoIP
+        dst_geo = _extract_value(log, [
+            "destination.geo",           # ECS format
+            "destination.geoip",
+            "geoip",                     # Suricata format (flat)
+            "dest_geoip",
+        ])
+        
         if dst_ip and dst_geo:
+            # Handle both dict and string formats
             geo_info = dst_geo
             if isinstance(dst_geo, dict):
-                geo_info = f"{dst_geo.get('country_name', '?')} {dst_geo.get('city_name', '')}".strip()
+                # Try multiple field names for country/city
+                country = _extract_value(dst_geo, ["country_name", "country", "iso_code"])
+                city = _extract_value(dst_geo, ["city_name", "city"])
+                geo_info = f"{country or '?'} {city or ''}".strip()
             geoip_data[dst_ip] = geo_info
         
         # ── Extract DNS info if available ──────────────────────────────────────
-        dns_question = _extract_value(log, ["dns.question.name", "dns.query"])
+        dns_question = _extract_value(log, ["dns.question.name", "dns.query", "query"])
         if dns_question:
             dns_queries[dns_question] += 1
         
@@ -719,12 +1072,23 @@ def _analyze_network_logs(logs: list[dict]) -> dict:
         "geoip_data": dict(list(geoip_data.items())[:30]),
         "dns_queries": dict(dns_queries.most_common(30)),
         "flow_stats": flow_stats,
+        "discovered_fields": dict(discovered_fields.most_common(50)),  # New: field discovery
     }
 
 
 def _format_analytics(analytics: dict) -> str:
     """Format comprehensive analytics into readable text for LLM."""
     lines = []
+    
+    # ── Discovered Field Mapping (Schema Observation) ───────────────────────────
+    discovered = analytics.get("discovered_fields", {})
+    if discovered:
+        lines.append("═ DETECTED FIELDS IN DATA ═")
+        lines.append("(This schema information is stored for future queries)")
+        for field, count in list(discovered.items())[:20]:
+            pct = (count / max(sum(discovered.values()), 1)) * 100
+            lines.append(f"  {field}: {pct:.1f}%")
+        lines.append("")
     
     # Flow statistics
     stats = analytics.get("flow_stats", {})
@@ -849,3 +1213,38 @@ def _parse_json_response(text: str) -> dict | None:
         except json.JSONDecodeError:
             pass
     return None
+
+
+def _format_schema_observation(discovered_fields: dict, identifier_field: str) -> str:
+    """
+    Format discovered fields as a schema observation document for RAG.
+    
+    This document helps future queries understand what fields are available
+    and their frequency, enabling smarter field selection for searches.
+    """
+    lines = [
+        "SCHEMA OBSERVATION",
+        f"Identifier field: {identifier_field}",
+        "",
+        "DETECTED FIELDS (by frequency):",
+    ]
+    
+    total_fields = sum(discovered_fields.values())
+    for field, count in list(discovered_fields.items())[:30]:
+        pct = (count / max(total_fields, 1)) * 100
+        lines.append(f"  {field}: {pct:.1f}% ({count} occurrences)")
+    
+    lines.extend([
+        "",
+        "FIELD CATEGORIES:",
+        "  IP-related: source.ip, src_ip, destination.ip, dest_ip, id.orig_h, id.resp_h",
+        "  Port-related: source.port, src_port, destination.port, dest_port, id.orig_p, id.resp_p",
+        "  Protocol: protocol, proto, transport, network.transport, app_proto",
+        "  Geographic: destination.geo, geoip, dest_geoip, country_name, city_name",
+        "  Timing: @timestamp, timestamp, event.created, event.duration",
+        "  Volume: bytes, bytes_sent, bytes_received, event.packets, network.bytes",
+        "",
+        "Use this schema to craft searches that will find the right fields.",
+    ])
+    
+    return "\n".join(lines)

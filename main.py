@@ -151,13 +151,81 @@ def onboard():
         os.environ["OPENAI_API_KEY"] = openai_key
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Phase 3: Write Configuration & Create Initial Files
+    # Phase 3: External Reputation Intelligence (Optional)
     # ──────────────────────────────────────────────────────────────────────────
-    console.print("[bold green]Step 3: Saving Configuration[/]\n")
+    console.print("[bold green]Step 3: External Threat Intelligence APIs (Optional)[/]\n")
+    console.print(
+        "[dim]SecurityClaw can enrich threat analysis with external reputation data:\n"
+        "  • AbuseIPDB (IP abuse history)\n"
+        "  • AlienVault OTX (threat intelligence pulses)\n"
+        "  • VirusTotal (multi-engine malware detection)\n"
+        "  • Cisco Talos (IP/domain intelligence)\n\n"
+        "These are [bold]optional[/] — threat_analyst works without them.\n"
+        "Setup takes 2 minutes. [/]\n"
+    )
+    
+    setup_apis = Confirm.ask("Configure external threat intelligence APIs?", default=False)
+    api_keys: dict = {}
+    
+    if setup_apis:
+        console.print("\n[cyan]Registering APIs (links provided):[/]\n")
+        
+        # AbuseIPDB
+        if Confirm.ask("Setup AbuseIPDB (IP reputation)?", default=True):
+            console.print(
+                "[dim]Sign up free at: https://www.abuseipdb.com/api\n"
+                "Free tier: 50 queries/day[/]"
+            )
+            api_key = Prompt.ask("AbuseIPDB API Key", default="", show_default=False)
+            if api_key:
+                api_keys["ABUSEIPDB_API_KEY"] = api_key
+        
+        # AlienVault OTX
+        if Confirm.ask("\nSetup AlienVault OTX (threat pulses)?", default=True):
+            console.print(
+                "[dim]Sign up free at: https://otx.alienvault.com/api\n"
+                "Free tier: Unlimited[/]"
+            )
+            api_key = Prompt.ask("AlienVault API Key", default="", show_default=False)
+            if api_key:
+                api_keys["ALIENVAULT_API_KEY"] = api_key
+        
+        # VirusTotal
+        if Confirm.ask("\nSetup VirusTotal (malware detection)?", default=True):
+            console.print(
+                "[dim]Sign up free at: https://www.virustotal.com\n"
+                "Free tier: 500 queries/day[/]"
+            )
+            api_key = Prompt.ask("VirusTotal API Key", default="", show_default=False)
+            if api_key:
+                api_keys["VIRUSTOTAL_API_KEY"] = api_key
+        
+        # Cisco Talos
+        if Confirm.ask("\nSetup Cisco Talos (enterprise intelligence)?", default=False):
+            console.print(
+                "[dim]Register at: https://dashboard.cisco.com/webex\n"
+                "Free tier: Available with registration[/]"
+            )
+            client_id = Prompt.ask("Talos Client ID", default="", show_default=False)
+            client_secret = Prompt.ask("Talos Client Secret", default="", show_default=False)
+            if client_id:
+                api_keys["TALOS_CLIENT_ID"] = client_id
+            if client_secret:
+                api_keys["TALOS_CLIENT_SECRET"] = client_secret
+        
+        if api_keys:
+            console.print(f"\n[green]✓ {len(api_keys)} API key(s) configured[/]")
+        else:
+            console.print("\n[yellow]No API keys configured; threat_analyst will work with local baselines only[/]")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Phase 4: Write Configuration & Create Initial Files
+    # ──────────────────────────────────────────────────────────────────────────
+    console.print("\n[bold green]Step 4: Saving Configuration[/]\n")
     _write_config(
         db_provider, db_host, db_port, db_user, db_pass, use_ssl, verify_certs,
         logs_index, anomaly_index, vector_index,
-        llm_provider, llm_config
+        llm_provider, llm_config, api_keys
     )
 
     # Create SITUATION.md if it doesn't exist
@@ -322,9 +390,13 @@ def chat():
                 console.print()
                 continue
 
-            # Route the question
+            # Load conversation history for context (last 2 turns)
+            conversation_history = load_conversation_history(conversation_id)
+            recent_history = conversation_history[-4:] if conversation_history else []  # Last 2 Q&A pairs
+            
+            # Route the question with conversation context
             console.print("\n[dim]Analyzing question...[/]")
-            routing = route_question(user_input, available_skills, llm, instruction)
+            routing = route_question(user_input, available_skills, llm, instruction, recent_history)
 
             console.print(f"[dim]→ Reasoning: {routing.get('reasoning', 'N/A')}[/]")
 
@@ -333,10 +405,10 @@ def chat():
                 skills_str = ", ".join(routing["skills"])
                 console.print(f"[dim]→ Skills: {skills_str}[/]\n")
 
-                skill_results = execute_skill_workflow(routing["skills"], runner, {}, routing)
+                skill_results = execute_skill_workflow(routing["skills"], runner, {}, routing, recent_history)
 
-                # Format response
-                response = format_response(user_input, routing, skill_results, llm)
+                # Format response with thinking-action-reflection loop
+                response = format_response(user_input, routing, skill_results, llm, cfg)
             else:
                 # Direct response without skills
                 console.print("[dim]→ No skills needed\n[/]")
@@ -406,8 +478,12 @@ def _write_config(
     vector_index: str,
     llm_provider: str,
     llm_config: dict,
+    api_keys: dict = None,
 ) -> None:
-    """Update config.yaml and .env with user settings(Credentials only in .env)."""
+    """Update config.yaml and .env with user settings (Credentials only in .env)."""
+    if api_keys is None:
+        api_keys = {}
+    
     config_path = Path(__file__).parent / "config.yaml"
     env_path = Path(__file__).parent / ".env"
 
@@ -436,7 +512,7 @@ def _write_config(
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
     console.print(f"  [dim]Written to {config_path.name}[/]")
 
-    # Write .env with credentials
+    # Write .env with credentials AND API keys
     env_lines = []
     if db_user:
         env_lines.append(f"DB_USERNAME={db_user}")
@@ -444,6 +520,11 @@ def _write_config(
         env_lines.append(f"DB_PASSWORD={db_pass}")
     if llm_provider == "openai" and "OPENAI_API_KEY" in os.environ:
         env_lines.append(f"OPENAI_API_KEY={os.environ['OPENAI_API_KEY']}")
+    
+    # Add external API keys
+    for api_key_name, api_key_value in api_keys.items():
+        if api_key_value:
+            env_lines.append(f"{api_key_name}={api_key_value}")
 
     if env_lines:
         env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")

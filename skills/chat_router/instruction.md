@@ -21,6 +21,7 @@ The SOC agent has these security analysis skills:
 - **rag_querier**: Searches stored baselines to answer questions about network behavior patterns
 - **anomaly_watcher**: Monitors and enriches anomaly detection findings in real-time  
 - **threat_analyst**: Analyzes security findings using RAG context to determine threat level
+- **forensic_examiner**: Reconstructs incident timelines by linking DNS queries, network flows, and alerts (±5 minutes around incident)
 
 ## Routing Logic
 
@@ -32,6 +33,15 @@ The SOC agent has these security analysis skills:
 - For those questions, use `rag_querier` instead to search existing baselines
 
 ### Single Skill Questions
+
+**Reconstruct Incident Timeline** (forensic_examiner):
+```
+Q: "What happened with 62.60.131.168 at 14:32?"
+Q: "Can you build a timeline of the incident with domain.com?"
+Q: "Give me the sequence of events around this alert"
+Q: "What did 192.168.1.100 do 5 minutes before the alert?"
+→ Use: forensic_examiner (reconstructs ±5 min timeline linking DNS→flows→alerts)
+```
 
 **Query Baselines** (rag_querier):
 ```
@@ -121,7 +131,18 @@ Response:
 }
 ```
 
-**Example 4: General Question**
+**Example 4: Incident Timeline Reconstruction**
+```
+Q: "What happened with 192.168.1.100 around 14:32?"
+Response:
+{
+  "reasoning": "User asking to reconstruct incident timeline with sequence of events",
+  "skills": ["forensic_examiner"],
+  "parameters": {"question": "What happened with 192.168.1.100 around 14:32?"}
+}
+```
+
+**Example 5: General Question**
 ```
 Q: "What is a port scan?"
 Response:

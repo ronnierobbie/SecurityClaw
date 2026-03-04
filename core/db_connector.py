@@ -223,14 +223,32 @@ class OpenSearchConnector(BaseDBConnector):
         k: int = 5,
         filters: Optional[dict] = None,
     ) -> list[dict]:
+        """
+        k-NN approximate nearest-neighbor search.
+        Handles filters at the query level (not in KNN block) for compatibility with NMSLIB.
+        """
         knn_body: dict = {
             "vector": vector,
             "k": k,
         }
-        if filters:
-            knn_body["filter"] = filters
+        # Note: NMSLIB doesn't support filters inside the KNN block,
+        # so we apply filters at the outer query level instead
 
-        query: dict = {"knn": {"embedding": knn_body}}
+        query: dict
+        if filters:
+            # Build a bool query with both KNN and filter
+            query = {
+                "bool": {
+                    "must": {
+                        "knn": {"embedding": knn_body}
+                    },
+                    "filter": filters
+                }
+            }
+        else:
+            # Simple KNN query without filters
+            query = {"knn": {"embedding": knn_body}}
+        
         try:
             resp = self._client.search(index=index, body={"query": query}, size=k)
             return [
@@ -265,8 +283,12 @@ class OpenSearchConnector(BaseDBConnector):
     # Vector index bootstrap
     # ------------------------------------------------------------------
 
-    def ensure_vector_index(self, index: str, dims: int = 384) -> None:
-        """Create a k-NN enabled index for embedding storage."""
+    def ensure_vector_index(self, index: str, dims: int = 768) -> None:
+        """Create a k-NN enabled index for embedding storage.
+        
+        Default dims=768 is a reasonable default, but callers should
+        explicitly pass dims from their LLM provider's embedding_dimension.
+        """
         settings = {
             "index": {
                 "knn": True,

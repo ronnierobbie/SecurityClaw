@@ -53,6 +53,18 @@ class Config:
             env_overrides.setdefault("llm", {})["openai_api_key"] = os.getenv("OPENAI_API_KEY")
         if os.getenv("OLLAMA_BASE_URL"):
             env_overrides.setdefault("llm", {})["ollama_base_url"] = os.getenv("OLLAMA_BASE_URL")
+        
+        # External reputation intelligence API keys
+        if os.getenv("ABUSEIPDB_API_KEY"):
+            env_overrides.setdefault("apis", {})["abuseipdb_key"] = os.getenv("ABUSEIPDB_API_KEY")
+        if os.getenv("ALIENVAULT_API_KEY"):
+            env_overrides.setdefault("apis", {})["alienvault_key"] = os.getenv("ALIENVAULT_API_KEY")
+        if os.getenv("VIRUSTOTAL_API_KEY"):
+            env_overrides.setdefault("apis", {})["virustotal_key"] = os.getenv("VIRUSTOTAL_API_KEY")
+        if os.getenv("TALOS_CLIENT_ID"):
+            env_overrides.setdefault("apis", {})["talos_client_id"] = os.getenv("TALOS_CLIENT_ID")
+        if os.getenv("TALOS_CLIENT_SECRET"):
+            env_overrides.setdefault("apis", {})["talos_client_secret"] = os.getenv("TALOS_CLIENT_SECRET")
 
         self._data = _deep_merge(self._data, env_overrides)
 
